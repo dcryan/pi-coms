@@ -9,7 +9,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-const [provider, model] = (process.argv[2] ?? "claude-bridge/claude-haiku-5-5").split("/");
+const [provider, model] = (process.argv[2] ?? "claude-code/claude-haiku-5-5").split("/");
 const repo = path.resolve(import.meta.dirname, "..");
 const comsDir = fs.mkdtempSync("/tmp/coms-e2e-");
 const workDir = fs.mkdtempSync("/tmp/coms-e2e-work-");
@@ -26,6 +26,8 @@ class Agent {
 		this.name = name;
 		this.proc = spawn("pi", [
 			"--mode", "rpc", "--no-session", "-e", repo,
+			// Keep the user's own MCP servers, skills and AGENTS.md out of the test.
+			"--no-mcp", "--no-skills", "--no-context-files",
 			"--provider", provider, "--model", model,
 			...(join ? ["--coms-name", name, "--coms-project", "e2e"] : []),
 		], { cwd: workDir, env: { ...process.env, PI_COMS_DIR: comsDir }, stdio: ["pipe", "pipe", "pipe"] });
@@ -149,15 +151,26 @@ try {
 	// 2. Fire-and-forget: the reply comes back as a message and starts a turn.
 	{
 		const a0 = alice.mark();
+		const b0 = bob.mark();
 		alice.prompt(
 			"Use coms_send to ask bob: 'What is 17 times 23? Answer with just the number.' "
 			+ "Do NOT call coms_await. End your turn right after sending.",
 		);
-		await alice.waitFor(() => alice.customMessages("coms-reply", a0).length >= 1 && alice.settledCount(a0) >= 2, "scenario 2", 240_000);
+		// The reply may land after alice's run has ended (a new run) or just
+		// before (the same run continues). Either way she must respond to it.
+		const answeredReply = () => {
+			const events = alice.since(a0);
+			const at = events.findIndex((e) => e.type === "message_end" && e.message?.role === "custom" && e.message.customType === "coms-reply");
+			if (at < 0) return false;
+			const after = events.slice(at);
+			return after.some((e) => e.type === "message_end" && e.message?.role === "assistant") && after.some((e) => e.type === "agent_settled");
+		};
+		await alice.waitFor(answeredReply, "scenario 2", 240_000);
+		await bob.waitFor(() => bob.settledCount(b0) >= 1, "bob to finish scenario 2");
 		const reply = alice.customMessages("coms-reply", a0)[0].message;
 		check("2. alice did not block", !alice.toolCalls(a0).includes("coms_await"), alice.toolCalls(a0).join(","));
 		check("2. reply delivered as a message", /391/.test(String(reply.content)), String(reply.content).split("\n").at(-1));
-		check("2. reply started a new turn", alice.settledCount(a0) >= 2);
+		check("2. alice responded to the reply", /391/.test(alice.lastAssistantText(a0)), alice.lastAssistantText(a0).slice(0, 80));
 	}
 
 	// 3. The receiver is busy with its own user's work when the message lands.
@@ -229,6 +242,9 @@ try {
 	check("run completed", false, err.message);
 	for (const a of [alice, bob, carol]) {
 		console.log(`  ${a.name}: tools [${a.toolCalls().join(", ")}] · last reply: ${a.lastAssistantText().slice(0, 200)}`);
+		const failed = a.events.filter((e) => e.type === "message_end" && e.message?.stopReason === "error").at(-1);
+		if (failed) console.log(`  ${a.name}: model error: ${String(failed.message.errorMessage).slice(0, 300)}`);
+		if (process.env.E2E_DUMP) fs.writeFileSync(`${process.env.E2E_DUMP}-${a.name}.jsonl`, a.events.map((e) => JSON.stringify(e)).join("\n"));
 	}
 } finally {
 	alice.stop();
