@@ -41,6 +41,7 @@ async function agent(
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	const notices: { text: string; level: string }[] = [];
+	let stale = false;
 	let activeTools = new Set(["read", "bash"]);
 	const flags: Record<string, unknown> = { "coms-project": "test", ...(name ? { "coms-name": name } : {}), ...extraFlags };
 	// Messages pi has queued for the model but not yet emitted.
@@ -66,7 +67,15 @@ async function agent(
 		cwd: "/tmp",
 		model: { id: "test-model" },
 		getContextUsage: () => ({ percent: 10 }),
-		ui: { notify: (text: string, level: string) => notices.push({ text, level }), setStatus() {}, setWidget() {} },
+		ui: {
+			// Like pi, a ctx from before the session was replaced throws when used.
+			notify: (text: string, level: string) => {
+				if (stale) throw new Error("this extension ctx is stale after session replacement");
+				notices.push({ text, level });
+			},
+			setStatus() {},
+			setWidget() {},
+		},
 		sessionManager: {
 			getSessionFile: () => session.file,
 			getSessionId: () => `id:${session.file ?? "ephemeral"}`,
@@ -116,6 +125,7 @@ async function agent(
 		 */
 		replace: async (reason: "new" | "resume" | "fork" | "reload", nextFile = session.file) => {
 			await emit("session_shutdown", { reason });
+			stale = true;
 			// A fork starts as a copy of the conversation, records included.
 			if (reason === "fork") sessions.set(nextFile!, [...entries]);
 			const start = reason === "reload" ? { reason } : { reason, previousSessionFile: session.file };
@@ -752,6 +762,7 @@ test("shutting down during a join cancels it instead of leaving a ghost agent", 
 		await new Promise((r) => setTimeout(r, 50));
 		assert.deepEqual(agentFiles().sort(), ["alice.json"]);
 		assert.equal(b.state.identity, null);
+		assert.deepEqual(b.notices.filter((n) => n.level === "error"), []);
 	} finally {
 		hung.close();
 	}
@@ -846,4 +857,62 @@ test("suffixed names stay within 32 characters", () => {
 	writeEntry({ name: long });
 	const name = registry.uniqueName("test", long);
 	assert.equal(name, "a".repeat(31) + "2");
+});
+
+test("/coms leave cancels a join that is still in progress", async () => {
+	const b = await agent("bob", {}, {}, { file: "/sessions/bob.jsonl" });
+	agents.push(b);
+	const hung = await fakePeer("hung", () => {});
+	try {
+		await sendRaw(readEntry("bob").endpoint, { type: "prompt", sender_endpoint: hung.endpoint, sender_name: "hung" });
+		await until(() => b.state.inbound.size === 1);
+		const renaming = b.command("join robert"); // waits in leave() on the hung sender
+		await b.command("leave");
+		hung.close();
+		await renaming;
+		await new Promise((r) => setTimeout(r, 50));
+		assert.equal(b.state.identity, null);
+		assert.deepEqual(agentFiles(), []);
+		assert.deepEqual(b.notices.map((n) => n.text), ["📡 left coms"]);
+		const resumed = await b.replace("reload");
+		agents.push(resumed);
+		assert.equal(resumed.state.identity, null);
+	} finally {
+		hung.close();
+	}
+});
+
+test("a join cut short by /new fails quietly on the replaced session", async () => {
+	const b = await agent("bob", {}, {}, { file: "/sessions/bob.jsonl" });
+	const hung = await fakePeer("hung", () => {});
+	try {
+		await sendRaw(readEntry("bob").endpoint, { type: "prompt", sender_endpoint: hung.endpoint, sender_name: "hung" });
+		await until(() => b.state.inbound.size === 1);
+		const renaming = b.command("join robert");
+		const fresh = await b.replace("new", "/sessions/new.jsonl");
+		agents.push(fresh);
+		hung.close();
+		await renaming; // must not reject on the stale ctx
+		assert.deepEqual(b.notices, []);
+		assert.deepEqual(agentFiles(), []);
+	} finally {
+		hung.close();
+	}
+});
+
+test("/coms leave that finishes after /new doesn't throw on the replaced session", async () => {
+	const b = await agent("bob", {}, {}, { file: "/sessions/bob.jsonl" });
+	const hung = await fakePeer("hung", () => {});
+	try {
+		await sendRaw(readEntry("bob").endpoint, { type: "prompt", sender_endpoint: hung.endpoint, sender_name: "hung" });
+		await until(() => b.state.inbound.size === 1);
+		const leaving = b.command("leave"); // waits on the hung sender
+		const fresh = await b.replace("new", "/sessions/new.jsonl");
+		agents.push(fresh);
+		hung.close();
+		await leaving;
+		assert.deepEqual(b.notices, []);
+	} finally {
+		hung.close();
+	}
 });

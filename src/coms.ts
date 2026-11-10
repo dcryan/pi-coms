@@ -511,6 +511,9 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 	// Bumped by every join and by shutdown, so a join still waiting on the
 	// socket or on leaving its old identity can tell it has been superseded.
 	let joinGeneration = 0;
+	let joinsInFlight = 0;
+	/** Thrown by a join that a later join, a leave or a shutdown has cancelled. */
+	class Superseded extends Error {}
 
 	/**
 	 * Opens this session's socket, registers it and records the membership in
@@ -519,6 +522,15 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 	 * system prompt's frontmatter, then to defaults.
 	 */
 	async function join(ctx: any, opts: JoinOptions = {}): Promise<void> {
+		joinsInFlight++;
+		try {
+			await joinNow(ctx, opts);
+		} finally {
+			joinsInFlight--;
+		}
+	}
+
+	async function joinNow(ctx: any, opts: JoinOptions): Promise<void> {
 		const generation = ++joinGeneration;
 		const fm = frontmatterFromArgv(process.argv);
 		const session_id = ulid();
@@ -531,7 +543,7 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 		}
 		const desired = typedName ?? identity?.name ?? tidyName(fm.name) ?? `agent-${session_id.slice(-6).toLowerCase()}`;
 		if (identity) await leave(`${identity.name} left coms before replying`);
-		if (generation !== joinGeneration) throw new Error("superseded by a later join or shutdown");
+		if (generation !== joinGeneration) throw new Superseded();
 
 		const name = registry.uniqueName(project, desired);
 		const endpoint = makeEndpoint(comsDir, session_id);
@@ -541,7 +553,7 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 		const bound = await bindEndpoint(endpoint, (socket) => void connHandler(socket));
 		if (generation !== joinGeneration) {
 			bound.close();
-			throw new Error("superseded by a later join or shutdown");
+			throw new Superseded();
 		}
 		server = bound;
 
@@ -626,6 +638,13 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 	// out too.
 	type Membership = { session_id?: string } & (({ joined: true } & Required<JoinOptions>) | { joined: false });
 
+	/** Notify, unless pi replaced the session while the command was waiting: its ctx then throws. */
+	function say(ctx: any, text: string, level: "info" | "warning" | "error"): void {
+		try {
+			ctx.ui?.notify?.(text, level);
+		} catch { /* stale ctx */ }
+	}
+
 	function recordMembership(m: Membership): void {
 		try {
 			pi.appendEntry("coms-membership", { ...m, session_id: currentCtx?.sessionManager?.getSessionId?.() });
@@ -663,7 +682,8 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 		try {
 			await join(ctx, opts);
 		} catch (err: any) {
-			ctx.ui?.notify?.(`📡 coms: could not join — ${err?.message ?? err}`, "error");
+			if (err instanceof Superseded) return;
+			say(ctx, `📡 coms: could not join — ${err?.message ?? err}`, "error");
 		}
 	});
 
@@ -973,21 +993,25 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 			try {
 				if (sub === "join") {
 					await join(ctx, parseJoin(rest));
-					ctx.ui.notify(`📡 joined coms as ${identity!.name}@${identity!.project}`, "info");
+					say(ctx, `📡 joined coms as ${identity!.name}@${identity!.project}`, "info");
 				} else if (sub === "leave") {
-					if (!identity) return ctx.ui.notify("coms is already off in this session", "info");
-					const name = identity.name;
+					if (!identity && joinsInFlight === 0) return say(ctx, "coms is already off in this session", "info");
+					// Also cancels a join that is still in progress, which has no identity yet.
+					joinGeneration++;
+					const name = identity?.name;
 					recordMembership({ joined: false });
-					await leave(`${name} left coms before replying`);
-					ctx.ui.notify(`📡 ${name} left coms`, "info");
+					if (name) await leave(`${name} left coms before replying`);
+					say(ctx, name ? `📡 ${name} left coms` : "📡 left coms", "info");
 				} else if (sub === undefined) {
 					if (identity) await refreshPool();
-					ctx.ui.notify(describe(), "info");
+					say(ctx, describe(), "info");
 				} else {
-					ctx.ui.notify(`unknown subcommand "${sub}"; use /coms, /coms join or /coms leave`, "warning");
+					say(ctx, `unknown subcommand "${sub}"; use /coms, /coms join or /coms leave`, "warning");
 				}
 			} catch (err: any) {
-				ctx.ui.notify(`📡 coms: ${err?.message ?? err}`, "error");
+				// Whatever cancelled the join has already told the user what happened.
+				if (err instanceof Superseded) return;
+				say(ctx, `📡 coms: ${err?.message ?? err}`, "error");
 			}
 		},
 	});
