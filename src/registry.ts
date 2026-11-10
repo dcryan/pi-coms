@@ -72,16 +72,6 @@ export function createRegistry(comsDir: string) {
 		return out;
 	}
 
-	function projects(): string[] {
-		try {
-			return fs.readdirSync(projectsRoot).filter((d) => {
-				try { return fs.statSync(path.join(projectsRoot, d)).isDirectory(); } catch { return false; }
-			});
-		} catch {
-			return [];
-		}
-	}
-
 	/**
 	 * Reads a project's entries and deletes those whose process has exited.
 	 * Agents whose process is alive but not listening are found by pinging.
@@ -101,29 +91,22 @@ export function createRegistry(comsDir: string) {
 		return out;
 	}
 
-	function liveAll(): RegistryEntry[] {
-		return projects().flatMap((p) => live(p));
-	}
-
+	/** `desired`, or `desired2`, `desired3`… shortened to stay within 32 characters. */
 	function uniqueName(project: string, desired: string): string {
 		const taken = new Set(live(project).map((e) => e.name));
 		if (!taken.has(desired)) return desired;
+		const candidate = (n: number) => desired.slice(0, 32 - String(n).length) + n;
 		let n = 2;
-		while (taken.has(`${desired}${n}`)) n++;
-		return `${desired}${n}`;
+		while (taken.has(candidate(n))) n++;
+		return candidate(n);
 	}
 
-	/** Name match in the caller's project first, then session id, then name, across projects. */
-	function resolve(target: string, project: string | null): RegistryEntry | null {
-		if (project) {
-			const local = live(project).find((e) => e.name === target);
-			if (local) return local;
-		}
-		const all = liveAll();
-		return all.find((e) => e.session_id === target) ?? all.find((e) => e.name === target) ?? null;
+	/** An agent in the project, by name or session id. Projects never see each other. */
+	function resolve(target: string, project: string): RegistryEntry | null {
+		return live(project).find((e) => e.name === target || e.session_id === target) ?? null;
 	}
 
-	return { write, remove, read, live, liveAll, projects, uniqueName, resolve };
+	return { write, remove, read, live, uniqueName, resolve };
 }
 
 export type Registry = ReturnType<typeof createRegistry>;

@@ -21,12 +21,13 @@ class Agent {
 	private waiters: (() => void)[] = [];
 	readonly name: string;
 
-	constructor(name: string) {
+	/** Joins coms at startup unless `join` is false. */
+	constructor(name: string, join = true) {
 		this.name = name;
 		this.proc = spawn("pi", [
 			"--mode", "rpc", "--no-session", "-e", repo,
 			"--provider", provider, "--model", model,
-			"--coms-name", name, "--coms-project", "e2e",
+			...(join ? ["--coms-name", name, "--coms-project", "e2e"] : []),
 		], { cwd: workDir, env: { ...process.env, PI_COMS_DIR: comsDir }, stdio: ["pipe", "pipe", "pipe"] });
 		this.proc.stdout!.on("data", (chunk: Buffer) => {
 			this.buf = Buffer.concat([this.buf, chunk]);
@@ -108,18 +109,24 @@ function check(name: string, ok: boolean, detail = "") {
 
 const alice = new Agent("alice");
 const bob = new Agent("bob");
+const carol = new Agent("carol", false);
+const registryFile = (name: string) => path.join(comsDir, "projects", "e2e", "agents", `${name}.json`);
 
-async function ready(a: Agent) {
+async function started(a: Agent) {
 	const id = `state-${a.name}`;
 	a.send({ id, type: "get_state" });
 	await a.waitFor((ev) => ev.some((e) => e.type === "response" && e.id === id), "startup", 60_000);
+}
+
+async function ready(a: Agent) {
+	await started(a);
 	// Registry entry written at session_start.
-	const file = path.join(comsDir, "projects", "e2e", "agents", `${a.name}.json`);
-	await a.waitFor(() => fs.existsSync(file), "registry entry", 30_000);
+	await a.waitFor(() => fs.existsSync(registryFile(a.name)), "registry entry", 30_000);
 }
 
 try {
-	await Promise.all([ready(alice), ready(bob)]);
+	await Promise.all([ready(alice), ready(bob), started(carol)]);
+	check("0. a session without --coms-name stays out", !fs.existsSync(registryFile("carol")));
 	console.log(`agents up · ${provider}/${model} · coms dir ${comsDir}\n`);
 
 	// 1. Blocking round trip.
@@ -177,7 +184,25 @@ try {
 			&& JSON.stringify(e.message.content).toLowerCase().includes("local work finished")));
 	}
 
-	// 4. Bob crashes while alice waits on him: she hears about it within a ping
+	// 4. A running session joins with /coms join and can be messaged.
+	{
+		const a0 = alice.mark();
+		const c0 = carol.mark();
+		carol.prompt('/coms join carol --project e2e --purpose "Answers trivia"');
+		await carol.waitFor(() => fs.existsSync(registryFile("carol")), "carol to join", 30_000);
+		const entry = JSON.parse(fs.readFileSync(registryFile("carol"), "utf-8"));
+		check("4. /coms join registered carol", entry.purpose === "Answers trivia", entry.purpose);
+		alice.prompt(
+			"Use coms_send to ask carol: 'How many legs does a spider have? Answer with just the number.' "
+			+ "Then call coms_await and tell me exactly what carol answered.",
+		);
+		await alice.waitFor(() => alice.settledCount(a0) >= 1 && alice.toolCalls(a0).includes("coms_await"), "scenario 4");
+		await carol.waitFor(() => carol.settledCount(c0) >= 1, "carol to answer");
+		check("4. carol answered with coms_reply", carol.toolCalls(c0).includes("coms_reply"), carol.toolCalls(c0).join(","));
+		check("4. alice relayed 8", /\b8\b|eight/i.test(alice.lastAssistantText(a0)), alice.lastAssistantText(a0).slice(0, 80));
+	}
+
+	// 5. Bob crashes while alice waits on him: she hears about it within a ping
 	//    cycle instead of after the 30-minute timeout.
 	{
 		const a0 = alice.mark();
@@ -192,19 +217,23 @@ try {
 		bob.crash();
 		await alice.waitFor(() => alice.customMessages("coms-reply", a0).length >= 1, "crash notice", 60_000);
 		const notice = alice.customMessages("coms-reply", a0)[0];
-		check("4. alice told bob is gone", notice.message.details?.error === "bob is no longer running",
+		check("5. alice told bob is gone", notice.message.details?.error === "bob is no longer running",
 			`${((notice.receivedAt - crashedAt) / 1000).toFixed(1)}s after the crash`);
-		check("4. bob's registry entry and socket removed",
+		check("5. bob's registry entry and socket removed",
 			!fs.existsSync(path.join(comsDir, "projects", "e2e", "agents", "bob.json")) && !fs.existsSync(endpoint));
 	}
 
-	check("no extension errors", alice.errors().length + bob.errors().length === 0,
-		JSON.stringify([...alice.errors(), ...bob.errors()]).slice(0, 200));
+	const errors = [...alice.errors(), ...bob.errors(), ...carol.errors()];
+	check("no extension errors", errors.length === 0, JSON.stringify(errors).slice(0, 200));
 } catch (err: any) {
 	check("run completed", false, err.message);
+	for (const a of [alice, bob, carol]) {
+		console.log(`  ${a.name}: tools [${a.toolCalls().join(", ")}] · last reply: ${a.lastAssistantText().slice(0, 200)}`);
+	}
 } finally {
 	alice.stop();
 	bob.stop();
+	carol.stop();
 	await new Promise((r) => setTimeout(r, 1000));
 	const leftover = fs.readdirSync(path.join(comsDir, "projects", "e2e", "agents")).filter((f) => f.endsWith(".json"));
 	check("registry cleaned up on exit", leftover.length === 0, leftover.join(","));

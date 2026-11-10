@@ -57,6 +57,12 @@ interface AgentCard {
 	queue_depth: number;
 }
 
+interface JoinOptions {
+	name?: string;
+	project?: string;
+	purpose?: string;
+}
+
 interface Result {
 	response?: unknown;
 	error?: string | null;
@@ -145,9 +151,10 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 	const registry = createRegistry(comsDir);
 	const renderers = tui ? toolRenderers(tui) : null;
 
-	pi.registerFlag("coms-name", { description: "coms agent name (default: system prompt frontmatter, then agent-XXXXXX)", type: "string" });
+	pi.registerFlag("coms", { description: "Join coms at startup (also implied by --coms-name)", type: "boolean", default: false });
+	pi.registerFlag("coms-name", { description: "coms agent name; joins coms (default: system prompt frontmatter, then agent-XXXXXX)", type: "string" });
 	pi.registerFlag("coms-purpose", { description: "coms agent purpose shown to peers", type: "string" });
-	pi.registerFlag("coms-project", { description: "coms project namespace for peer discovery", type: "string", default: "default" });
+	pi.registerFlag("coms-project", { description: "coms project; agents only see and message agents in the same project", type: "string" });
 	pi.registerFlag("coms-color", { description: "coms agent color as #RRGGBB", type: "string" });
 	pi.registerFlag("coms-explicit", { description: "Hide this agent from discovery; peers must address it by exact name", type: "boolean", default: false });
 
@@ -161,7 +168,6 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 		cwd: string;
 		endpoint: string;
 		started_at: string;
-		registryFile: string;
 	} | null = null;
 	let currentCtx: any = null;
 	let server: net.Server | null = null;
@@ -242,13 +248,13 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 		if (out.awaiting === 0) deliverReply(out);
 	}
 
-	async function sendResponse(msg: Inbound, response: unknown, error: string | null): Promise<void> {
+	async function sendResponse(msg: Inbound, response: unknown, error: string | null, self = identity!): Promise<void> {
 		const env: ResponseEnvelope = {
 			type: "response",
 			msg_id: msg.msg_id,
-			sender_session: identity!.session_id,
-			sender_endpoint: identity!.endpoint,
-			sender_name: identity!.name,
+			sender_session: self.session_id,
+			sender_endpoint: self.endpoint,
+			sender_name: self.name,
 			hops: msg.hops,
 			timestamp: nowIso(),
 			response,
@@ -258,11 +264,11 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 	}
 
 	/** Tells the sender this message will not be answered, then forgets it. */
-	async function failInbound(msg: Inbound, error: string): Promise<void> {
+	async function failInbound(msg: Inbound, error: string, self = identity!): Promise<void> {
 		inbound.delete(msg.msg_id);
 		updateStatus();
 		try {
-			await sendResponse(msg, null, error);
+			await sendResponse(msg, null, error, self);
 			log("inbound_failed", { msg_id: msg.msg_id, error });
 		} catch (e: any) {
 			log("inbound_failed_undeliverable", { msg_id: msg.msg_id, error, reason: e?.message });
@@ -276,6 +282,7 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 	}
 
 	function handlePrompt(socket: net.Socket, env: PromptEnvelope): void {
+		if (!identity) return answer(socket, { type: "nack", msg_id: env.msg_id, error: "receiver has left coms" });
 		if (typeof env.hops !== "number" || env.hops >= maxHops) {
 			return answer(socket, { type: "nack", msg_id: env.msg_id, error: `hop limit reached (${env.hops} >= ${maxHops})` });
 		}
@@ -387,8 +394,8 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 	 * heartbeat alone isn't enough, since a sleeping laptop pauses every
 	 * agent's heartbeat at once.
 	 */
-	async function pingPeer(entry: RegistryEntry): Promise<AgentCard | null> {
-		if (!identity) return null;
+	async function pingPeer(entry: RegistryEntry): Promise<{ card: AgentCard | null; gone: boolean }> {
+		if (!identity) return { card: null, gone: false };
 		try {
 			const pong = await sendEnvelope(entry.endpoint, {
 				type: "ping",
@@ -398,13 +405,14 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 				hops: 0,
 				timestamp: nowIso(),
 			}, pingTimeoutMs);
-			return pong?.type === "pong" ? pong.agent_card : null;
+			return { card: pong?.type === "pong" ? pong.agent_card : null, gone: false };
 		} catch (err) {
 			if (isDeadEndpointError(err) || heartbeatStale(entry)) {
 				registry.remove(entry);
 				log("peer_removed", { session_id: entry.session_id, name: entry.name, reason: (err as any)?.code ?? "stale" });
+				return { card: null, gone: true };
 			}
-			return null;
+			return { card: null, gone: false };
 		}
 	}
 
@@ -418,10 +426,16 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 	}
 
 	async function refreshPool(): Promise<void> {
-		if (!identity) return;
-		const peers = registry.live(identity.project).filter((e) => e.session_id !== identity!.session_id);
-		const cards = await Promise.all(peers.map((p) => pingPeer(p)));
-		const liveSessions = new Set(registry.liveAll().map((e) => e.session_id));
+		const self = identity;
+		if (!self) return;
+		const peers = registry.live(self.project).filter((e) => e.session_id !== self.session_id);
+		const pings = await Promise.all(peers.map((p) => pingPeer(p)));
+		// A leave or rejoin while pinging makes these results stale.
+		if (identity !== self) return;
+		const cards = pings.map((p) => p.card);
+		// Read again rather than reuse `peers`: a peer that joined during the
+		// pings may already have been sent a message.
+		const liveSessions = new Set(registry.live(self.project).map((e) => e.session_id));
 		failOrphanedOutbound(liveSessions);
 		let changed = false;
 		const seen = new Set<string>();
@@ -465,60 +479,97 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 			queue_depth: inbound.size,
 			heartbeat_at: nowIso(),
 		};
-		identity.registryFile = registry.write(entry, identity.project);
+		registry.write(entry, identity.project);
 	}
 
 	// ━━ Lifecycle ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-	pi.on("session_start", async (_event: unknown, ctx: any) => {
-		currentCtx = ctx;
-		if (identity) return;
-		const fm = frontmatterFromArgv(process.argv);
-		const flag = (name: string) => {
-			const v = pi.getFlag(name);
-			return typeof v === "string" && v.length > 0 ? v : undefined;
-		};
-		const project = flag("coms-project") ?? "default";
-		const session_id = ulid();
-		const desired = flag("coms-name") ?? fm.name ?? `agent-${session_id.slice(-6).toLowerCase()}`;
-		const name = registry.uniqueName(project, desired);
-		const color = [flag("coms-color"), fm.color].find(isValidHex) ?? fallbackColor(session_id);
-		const endpoint = makeEndpoint(comsDir, session_id);
+	const TOOL_NAMES = ["coms_list", "coms_send", "coms_reply", "coms_await"];
+	const VALID_ID = /^[A-Za-z0-9_-]{1,32}$/;
 
+	function flag(name: string): string | undefined {
+		const v = pi.getFlag(name);
+		return typeof v === "string" && v.length > 0 ? v : undefined;
+	}
+
+	/** The coms tools are only offered to the model while this session is joined. */
+	function setToolsActive(active: boolean): void {
 		try {
-			fs.mkdirSync(comsDir, { recursive: true, mode: 0o700 });
-			fs.chmodSync(comsDir, 0o700);
-			if (process.platform !== "win32") fs.mkdirSync(path.join(comsDir, "sockets"), { recursive: true, mode: 0o700 });
-			server = await bindEndpoint(endpoint, (socket) => void connHandler(socket));
-		} catch (err: any) {
-			ctx.ui?.notify?.(`📡 coms: could not start — ${err?.message ?? err}`, "error");
-			return;
+			const current: string[] = pi.getActiveTools();
+			pi.setActiveTools(active
+				? [...new Set([...current, ...TOOL_NAMES])]
+				: current.filter((t) => !TOOL_NAMES.includes(t)));
+		} catch { /* host without tool control */ }
+	}
+
+	/** Turns a borrowed name such as "Code Reviewer" into a valid one ("Code-Reviewer"). */
+	function tidyName(name: string | undefined): string | undefined {
+		const tidy = name?.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
+		return tidy || undefined;
+	}
+
+	// Bumped by every join and by shutdown, so a join still waiting on the
+	// socket or on leaving its old identity can tell it has been superseded.
+	let joinGeneration = 0;
+
+	/**
+	 * Opens this session's socket, registers it and records the membership in
+	 * the session. Values not given keep the current identity's when already
+	 * joined (so `/coms join newname` is a rename), else fall back to the
+	 * system prompt's frontmatter, then to defaults.
+	 */
+	async function join(ctx: any, opts: JoinOptions = {}): Promise<void> {
+		const generation = ++joinGeneration;
+		const fm = frontmatterFromArgv(process.argv);
+		const session_id = ulid();
+		const project = opts.project ?? identity?.project ?? "default";
+		const purpose = opts.purpose ?? identity?.purpose ?? fm.description ?? "";
+		const typedName = opts.name;
+		if (!VALID_ID.test(project)) throw new Error(`project "${project}" may only use letters, numbers, - and _ (max 32)`);
+		if (typedName !== undefined && !VALID_ID.test(typedName)) {
+			throw new Error(`name "${typedName}" may only use letters, numbers, - and _ (max 32)`);
 		}
+		const desired = typedName ?? identity?.name ?? tidyName(fm.name) ?? `agent-${session_id.slice(-6).toLowerCase()}`;
+		if (identity) await leave(`${identity.name} left coms before replying`);
+		if (generation !== joinGeneration) throw new Error("superseded by a later join or shutdown");
+
+		const name = registry.uniqueName(project, desired);
+		const endpoint = makeEndpoint(comsDir, session_id);
+		fs.mkdirSync(comsDir, { recursive: true, mode: 0o700 });
+		fs.chmodSync(comsDir, 0o700);
+		if (process.platform !== "win32") fs.mkdirSync(path.join(comsDir, "sockets"), { recursive: true, mode: 0o700 });
+		const bound = await bindEndpoint(endpoint, (socket) => void connHandler(socket));
+		if (generation !== joinGeneration) {
+			bound.close();
+			throw new Error("superseded by a later join or shutdown");
+		}
+		server = bound;
 
 		identity = {
 			session_id,
 			name,
-			purpose: flag("coms-purpose") ?? fm.description ?? "",
-			color,
+			purpose,
+			color: [flag("coms-color"), fm.color].find(isValidHex) ?? fallbackColor(session_id),
 			project,
 			explicit: pi.getFlag("coms-explicit") === true,
 			cwd: ctx.cwd ?? process.cwd(),
 			endpoint,
 			started_at: nowIso(),
-			registryFile: "",
 		};
 		try {
 			writeRegistryEntry();
-		} catch (err: any) {
-			ctx.ui?.notify?.(`📡 coms: registry write failed — ${err?.message ?? err}`, "error");
+		} catch (err) {
 			server.close();
 			server = null;
 			identity = null;
-			return;
+			throw err;
 		}
+		// The name asked for, so a resume gets it back once a clash has gone.
+		recordMembership({ joined: true, name: desired, project, purpose: identity.purpose });
 		if (name !== desired) log("name_collision", { desired, assigned: name, project });
-		log("boot", { session_id, name, project });
+		log("join", { session_id, name, project });
 
+		setToolsActive(true);
 		updateStatus();
 		installPoolWidget();
 		pingTimer = setInterval(() => void refreshPool().catch(() => {}), pingIntervalMs);
@@ -526,6 +577,94 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 		keepaliveTimer = setInterval(() => { try { writeRegistryEntry(); } catch { /* best-effort */ } }, KEEPALIVE_INTERVAL_MS);
 		keepaliveTimer.unref?.();
 		void refreshPool().catch(() => {});
+	}
+
+	/**
+	 * Unregisters and closes the socket, then fails unanswered messages back
+	 * to their senders with `reason`. Teardown happens before any await, so no
+	 * message can arrive mid-leave and a second leave finds nothing to do.
+	 * Replies to messages this session sent can no longer arrive; those are
+	 * dropped.
+	 */
+	async function leave(reason: string): Promise<void> {
+		const self = identity;
+		if (!self) return;
+		identity = null;
+		if (pingTimer) clearInterval(pingTimer);
+		if (keepaliveTimer) clearInterval(keepaliveTimer);
+		pingTimer = keepaliveTimer = null;
+		server?.close();
+		server = null;
+		registry.remove(self);
+		log("leave", { session_id: self.session_id });
+		for (const out of outbound.values()) {
+			if (out.timer) clearTimeout(out.timer);
+			if (!out.result) {
+				out.result = { error: "this session left coms" };
+				out.resolve(out.result);
+			}
+		}
+		outbound.clear();
+		replyHops.clear();
+		peerCards.clear();
+		if (currentCtx?.hasUI) {
+			try {
+				currentCtx.ui.setWidget("coms-pool", undefined);
+				currentCtx.ui.setStatus("coms", undefined);
+			} catch { /* no UI */ }
+		}
+		setToolsActive(false);
+		const unanswered = [...inbound.values()];
+		await Promise.all(unanswered.map((m) => failInbound(m, reason, self)));
+	}
+
+	// Membership is recorded in the session itself (as a custom entry the model
+	// never sees), so it belongs to the conversation: /reload, /resume and
+	// pi -c rejoin a conversation that was joined, and /new starts out. Each
+	// record carries the session id it was written in, so a fork (/fork,
+	// /clone, pi --fork), which copies the records but gets a new id, starts
+	// out too.
+	type Membership = { session_id?: string } & (({ joined: true } & Required<JoinOptions>) | { joined: false });
+
+	function recordMembership(m: Membership): void {
+		try {
+			pi.appendEntry("coms-membership", { ...m, session_id: currentCtx?.sessionManager?.getSessionId?.() });
+		} catch { /* best-effort */ }
+	}
+
+	// Reads every entry, not just the current branch: membership belongs to
+	// the running session, so moving around with /tree doesn't change it.
+	function lastMembership(ctx: any): Membership | undefined {
+		const sessionId = ctx.sessionManager?.getSessionId?.();
+		let last: Membership | undefined;
+		for (const entry of ctx.sessionManager?.getEntries?.() ?? []) {
+			if (entry.type === "custom" && entry.customType === "coms-membership" && entry.data?.session_id === sessionId) {
+				last = entry.data;
+			}
+		}
+		return last;
+	}
+
+	// The --coms flags only apply when pi starts; after /new the session is a
+	// fresh agent and joins with /coms join. pi -c and pi --resume count as
+	// resuming.
+	pi.on("session_start", async (event: any, ctx: any) => {
+		currentCtx = ctx;
+		if (identity) return;
+		const reason = event?.reason ?? "startup";
+		let opts: JoinOptions | undefined;
+		if (reason === "startup" && (pi.getFlag("coms") === true || flag("coms-name"))) {
+			opts = { name: flag("coms-name"), project: flag("coms-project"), purpose: flag("coms-purpose") };
+		} else {
+			const last = lastMembership(ctx);
+			if (last?.joined) opts = { name: last.name, project: last.project, purpose: last.purpose };
+		}
+		if (!opts) return;
+		try {
+			await join(ctx, opts);
+		} catch (err: any) {
+			ctx.ui?.notify?.(`📡 coms: could not join — ${err?.message ?? err}`, "error");
+		}
 	});
 
 	// A message has reached the model once pi emits it; only then can the agent
@@ -572,50 +711,35 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 	});
 
 	pi.on("session_shutdown", async () => {
-		if (pingTimer) clearInterval(pingTimer);
-		if (keepaliveTimer) clearInterval(keepaliveTimer);
-		pingTimer = keepaliveTimer = null;
-		if (identity) {
-			await Promise.all([...inbound.values()].map((m) => failInbound(m, `${identity!.name} shut down before replying`)));
-		}
-		for (const out of outbound.values()) if (out.timer) clearTimeout(out.timer);
-		server?.close();
-		server = null;
-		if (identity) {
-			registry.remove(identity);
-			log("shutdown", { session_id: identity.session_id });
-		}
-		if (currentCtx?.hasUI) {
-			try { currentCtx.ui.setWidget("coms-pool", undefined); } catch { /* no UI */ }
-		}
-		identity = null;
+		joinGeneration++;
+		if (identity) await leave(`${identity.name} shut down before replying`);
 	});
 
 	// ━━ Tools ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 	function requireIdentity() {
-		if (!identity) throw new Error("coms is not running in this session");
+		if (!identity) throw new Error("coms is off in this session; the user can turn it on with /coms join");
 		return identity;
 	}
 
 	pi.registerTool({
 		name: "coms_list",
+		defaultActive: false,
 		label: "Coms List",
-		description: "List peer agents reachable through coms, with their purpose, model and context usage.",
+		description: "List the agents in your coms project, with their purpose, model and context usage.",
 		promptSnippet: "List peer pi agents you can message with coms_send",
 		parameters: {
 			type: "object",
 			properties: {
-				project: { type: "string", description: "Project namespace, or \"*\" for all. Defaults to your own." },
 				include_explicit: { type: "boolean", description: "Include agents hidden with --coms-explicit." },
 			},
 		},
 		async execute(_id: string, params: any) {
 			const self = requireIdentity();
-			const project = params.project ?? self.project;
-			const entries = (project === "*" ? registry.liveAll() : registry.live(project))
+			const project = self.project;
+			const entries = registry.live(project)
 				.filter((e) => e.session_id !== self.session_id && (params.include_explicit || !e.explicit));
-			const cards = await Promise.all(entries.map((e) => pingPeer(e)));
+			const cards = (await Promise.all(entries.map((e) => pingPeer(e)))).map((p) => p.card);
 			const agents = entries.map((e, i) => ({
 				name: e.name,
 				session_id: e.session_id,
@@ -638,6 +762,7 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 
 	pi.registerTool({
 		name: "coms_send",
+		defaultActive: false,
 		label: "Coms Send",
 		description:
 			"Send a message to a peer agent. Returns a msg_id once the peer has queued it. "
@@ -650,7 +775,7 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 		parameters: {
 			type: "object",
 			properties: {
-				target: { type: "string", description: "Peer name (from coms_list) or session id." },
+				target: { type: "string", description: "Peer name from coms_list." },
 				message: { type: "string", description: "The message to send." },
 				on_behalf_of: { type: "string", description: "msg_id of the coms message you are handling, if any." },
 				response_schema: { type: "object", description: "Optional JSON Schema the reply must match." },
@@ -660,7 +785,7 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 		async execute(_id: string, params: any) {
 			const self = requireIdentity();
 			const target = registry.resolve(params.target, self.project);
-			if (!target) throw new Error(`no live agent named "${params.target}"; call coms_list to see peers`);
+			if (!target) throw new Error(`no live agent named "${params.target}" in project ${self.project}; call coms_list to see peers`);
 			if (target.session_id === self.session_id) throw new Error("cannot message yourself");
 			const hops = chainHops(params.on_behalf_of);
 			if (hops >= maxHops) throw new Error(`hop limit reached (${hops} >= ${maxHops}); stop relaying and report back instead`);
@@ -715,6 +840,7 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 
 	pi.registerTool({
 		name: "coms_reply",
+		defaultActive: false,
 		label: "Coms Reply",
 		description: "Answer a coms message. This is the only way a reply reaches the sender.",
 		promptSnippet: "Answer a coms message from a peer agent by msg_id",
@@ -758,6 +884,7 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 
 	pi.registerTool({
 		name: "coms_await",
+		defaultActive: false,
 		label: "Coms Await",
 		description: "Wait for the reply to a message sent with coms_send.",
 		parameters: {
@@ -801,17 +928,67 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 		...renderers?.coms_await,
 	});
 
+	/** Splits command arguments on whitespace, keeping quoted strings together. */
+	function parseArgs(args: string): string[] {
+		return [...(args ?? "").matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((m) => m[1] ?? m[2] ?? m[3]);
+	}
+
+	function parseJoin(tokens: string[]): JoinOptions {
+		const opts: JoinOptions = {};
+		for (let i = 0; i < tokens.length; i++) {
+			const t = tokens[i];
+			if (t === "--project" || t === "--purpose") {
+				const value = tokens[++i];
+				if (value === undefined) throw new Error(`${t} needs a value`);
+				opts[t === "--project" ? "project" : "purpose"] = value;
+			} else if (t.startsWith("--")) {
+				throw new Error(`unknown option ${t}`);
+			} else if (opts.name === undefined) {
+				opts.name = t;
+			} else {
+				throw new Error(`unexpected "${t}"; quote a purpose with spaces`);
+			}
+		}
+		return opts;
+	}
+
+	function describe(): string {
+		if (!identity) return "📡 coms is off in this session. Join with /coms join [name] [--project p] [--purpose \"…\"]";
+		const waiting = [...outbound.values()].filter((o) => !o.result).map((o) => `→ waiting on ${o.target_name} (${o.msg_id})`);
+		const unanswered = [...inbound.values()].map((m) => `← unanswered from ${m.sender_name} (${m.msg_id})`);
+		return [`📡 ${identity.name}@${identity.project} · ${peerCards.size} peer(s)`, ...waiting, ...unanswered].join("\n");
+	}
+
 	pi.registerCommand("coms", {
-		description: "Show coms identity, peers and unanswered messages",
-		handler: async (_args: string, ctx: any) => {
-			if (!identity) return ctx.ui.notify("coms is not running in this session", "warning");
-			await refreshPool();
-			const waiting = [...outbound.values()].filter((o) => !o.result).map((o) => `→ ${o.target_name} ${o.msg_id}`);
-			const unanswered = [...inbound.values()].map((m) => `← ${m.sender_name} ${m.msg_id}`);
-			ctx.ui.notify(
-				[`📡 ${identity.name}@${identity.project} · ${peerCards.size} peer(s)`, ...waiting, ...unanswered].join("\n"),
-				"info",
-			);
+		description: "Show coms status, or join/leave: /coms join [name] [--project p] [--purpose \"…\"] · /coms leave",
+		// An exact match offers nothing, so Enter submits instead of accepting it.
+		getArgumentCompletions: (prefix: string) => {
+			const typed = prefix.trim();
+			const items = ["join", "leave"].filter((c) => c.startsWith(typed) && c !== typed).map((c) => ({ value: c, label: c }));
+			return items.length > 0 ? items : null;
+		},
+		handler: async (args: string, ctx: any) => {
+			currentCtx = ctx;
+			const [sub, ...rest] = parseArgs(args);
+			try {
+				if (sub === "join") {
+					await join(ctx, parseJoin(rest));
+					ctx.ui.notify(`📡 joined coms as ${identity!.name}@${identity!.project}`, "info");
+				} else if (sub === "leave") {
+					if (!identity) return ctx.ui.notify("coms is already off in this session", "info");
+					const name = identity.name;
+					recordMembership({ joined: false });
+					await leave(`${name} left coms before replying`);
+					ctx.ui.notify(`📡 ${name} left coms`, "info");
+				} else if (sub === undefined) {
+					if (identity) await refreshPool();
+					ctx.ui.notify(describe(), "info");
+				} else {
+					ctx.ui.notify(`unknown subcommand "${sub}"; use /coms, /coms join or /coms leave`, "warning");
+				}
+			} catch (err: any) {
+				ctx.ui.notify(`📡 coms: ${err?.message ?? err}`, "error");
+			}
 		},
 	});
 

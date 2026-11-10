@@ -6,26 +6,51 @@ Forked from `extensions/coms.ts` in [disler/pi-vs-claude-code](https://github.co
 
 ## Run
 
-Load it into the sessions that should talk to each other:
+Sessions only join coms when you ask. Start them with `--coms-name` (or `--coms` for a generated name):
 
 ```bash
 pi -e git:github.com/dcryan/pi-coms --coms-name planner --coms-purpose "Plans the work"
 pi -e git:github.com/dcryan/pi-coms --coms-name coder   --coms-purpose "Writes the code"
 ```
 
-Or install it so every pi session joins:
+Or install it once. Every session then has pi-coms loaded but switched off: no socket, no registry entry, and the coms tools hidden from the model until it joins.
 
 ```bash
 pi install git:github.com/dcryan/pi-coms
 ```
 
+A session that's already running can join from inside, after `/reload` if pi-coms was installed after it started:
+
+```text
+/coms join planner --project shop --purpose "Plans the work"
+/coms leave
+/coms
+```
+
+`/coms join` takes only what you type. Without a name it uses `name` from the system prompt's frontmatter (tidied to a valid name, so `Code Reviewer` becomes `Code-Reviewer`), then `agent-xxxxxx`; the project defaults to `default`. Run it again while joined to change identity: anything you don't give keeps its current value, so `/coms join newname` is a rename. A name already in use gets a number appended (`carol2`).
+
+Leaving or quitting ends the session's pending conversations, and so does anything that leaves and rejoins: a rename, `/reload`, and `/resume`. Messages it hasn't answered fail back to their senders, so they aren't left waiting. Replies it is still waiting on are lost, since they would arrive at the old socket, and the model isn't told.
+
+Membership belongs to the conversation, recorded in the session file:
+
+| | |
+|---|---|
+| `/reload` | stays joined |
+| `/resume`, `pi -c`, `pi --session` | rejoins if the conversation was joined, with the same name (the one asked for, not a `carol2` suffix), project and purpose |
+| `/new` | starts out, like a fresh pi started without flags |
+| `/fork`, `/clone`, `pi --fork` | starts out |
+| after `/coms leave` | stays out when resumed |
+
+The `--coms` flags only apply when pi starts. Given with `pi -c`, they win over the conversation's record.
+
 From a clone, use `pi -e ./pi-coms`.
 
 | Flag | Default |
 |---|---|
-| `--coms-name` | `name` in the frontmatter of the `--system-prompt`/`--append-system-prompt` file, else `agent-xxxxxx`. A taken name gets a number appended. |
-| `--coms-purpose` | frontmatter `description` |
-| `--coms-project` | `default`. Agents only see peers in the same project. |
+| `--coms` | off. Join when pi starts. |
+| `--coms-name` | Joins when pi starts, under this name: letters, numbers, `-` and `_`. Without it, `name` in the frontmatter of the `--system-prompt`/`--append-system-prompt` file (tidied), else `agent-xxxxxx`. A taken name gets a number appended. |
+| `--coms-purpose` | frontmatter `description`. Purpose for the startup join, shown to peers in `coms_list` and the widget. |
+| `--coms-project` | `default`. Project for the startup join. Agents only see and message agents in the same project. |
 | `--coms-color` | frontmatter `color`, else a colour derived from the session id |
 | `--coms-explicit` | off. Hides the agent from `coms_list` and the widget; peers can still message it by exact name. |
 
@@ -36,13 +61,11 @@ From a clone, use `pi -e ./pi-coms`.
 | `PI_COMS_TIMEOUT_MS` | `1800000` (30 min), how long a sender waits for a reply |
 | `PI_COMS_PING_INTERVAL_MS` | `10000` |
 
-`/coms` shows this agent's identity, its peers, messages it's waiting on and messages it hasn't answered.
-
 ## Tools
 
 | Tool | |
 |---|---|
-| `coms_list` | Peers with purpose, model, working directory and context usage |
+| `coms_list` | Agents in the same project, with purpose, model, working directory and context usage |
 | `coms_send` | Send a message. Returns a `msg_id` once the peer has queued it. Optional `on_behalf_of` and `response_schema`. |
 | `coms_reply` | Answer a received message by `msg_id`. The only way a reply reaches the sender. |
 | `coms_await` | Wait for the reply to a sent message |
@@ -59,7 +82,7 @@ If Bob reads a message and ends his turn without answering, he is reminded once.
 
 ## Discovery and cleanup
 
-An agent registers at startup by opening `sockets/<session-id>.sock` and writing `projects/<project>/agents/<name>.json` with its PID, socket and heartbeat time. It rewrites the file every 30 seconds. There's no central list: `coms_list` and `coms_send` read the folder on each call, and every agent re-reads it and pings its peers every 10 seconds for the widget.
+An agent registers when it joins by opening `sockets/<session-id>.sock` and writing `projects/<project>/agents/<name>.json` with its PID, socket and heartbeat time. It rewrites the file every 30 seconds. There's no central list: `coms_list` and `coms_send` read the folder on each call, and every agent re-reads it and pings its peers every 10 seconds for the widget.
 
 On a clean exit an agent deletes its own file and socket. After a crash, the other agents clean up. A peer is treated as dead, and its file and socket are deleted, when:
 
@@ -77,6 +100,8 @@ Messages still waiting on a peer that has disappeared fail with `<name> is no lo
 - **Hop count per message** instead of one shared variable.
 - **8 MiB message cap**, measured in bytes. Was 64 KB, measured in characters.
 - `coms_await` can be aborted with Esc.
+- **Opt-in.** Loading the extension no longer joins coms; `--coms`, `--coms-name` or `/coms join` does, and `/coms leave` exits. The tools are hidden from the model while a session is out.
+- **Projects are a hard boundary.** Names and session ids only resolve within the sender's project, and `coms_list` no longer lists other projects.
 - Flags are prefixed `--coms-` so they don't collide with other extensions.
 - No dependency on the demo repo's `themeMap.ts`. Tool schemas are plain JSON Schema.
 - Crashed agents' sockets are deleted, unreachable or hung agents are removed, and messages waiting on a vanished peer fail at the next ping cycle (see above).
@@ -84,7 +109,7 @@ Messages still waiting on a peer that has disappeared fail with `<name> is no lo
 
 ## Limits
 
-- Nothing is persisted. If either side restarts, messages still waiting for a reply are lost.
+- Messages aren't persisted, only membership. If either side restarts, messages still waiting for a reply are lost.
 - Any process running as your user can send a prompt to an agent. The coms directory is `0700`, so other users can't.
 - `response_schema` is shown to the receiver, and the reply must parse as JSON. It isn't validated against the schema.
 - Same machine only.

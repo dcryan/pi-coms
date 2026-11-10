@@ -10,6 +10,8 @@ import { createRegistry } from "../src/registry.ts";
 
 let comsDir: string;
 let agents: Agent[] = [];
+// Session files: custom entries an extension appended, by file path.
+const sessions = new Map<string, any[]>();
 
 beforeEach(() => {
 	// Short base path: unix socket paths are limited to ~104 bytes on macOS.
@@ -19,25 +21,44 @@ beforeEach(() => {
 afterEach(async () => {
 	for (const a of agents) await a.shutdown();
 	agents = [];
+	sessions.clear();
 	fs.rmSync(comsDir, { recursive: true, force: true });
 });
 
 type Agent = Awaited<ReturnType<typeof agent>>;
 
-async function agent(name: string, opts: { maxHops?: number; timeoutMs?: number } = {}) {
+/**
+ * A session with the extension loaded. With a name it joins at startup like
+ * `--coms-name`; with null it starts dormant.
+ */
+async function agent(
+	name: string | null,
+	opts: Record<string, unknown> = {},
+	extraFlags: Record<string, unknown> = {},
+	session: { file?: string; start?: Record<string, unknown>; branch?: () => any[] } = {},
+) {
 	const handlers = new Map<string, Function[]>();
 	const tools = new Map<string, any>();
-	const flags: Record<string, unknown> = { "coms-name": name, "coms-project": "test" };
+	const commands = new Map<string, any>();
+	const notices: { text: string; level: string }[] = [];
+	let activeTools = new Set(["read", "bash"]);
+	const flags: Record<string, unknown> = { "coms-project": "test", ...(name ? { "coms-name": name } : {}), ...extraFlags };
 	// Messages pi has queued for the model but not yet emitted.
 	const queued: any[] = [];
 	const transcript: any[] = [];
+	const entries = session.file ? (sessions.get(session.file) ?? sessions.set(session.file, []).get(session.file)!) : [];
 	const pi = {
 		on: (event: string, fn: Function) => handlers.set(event, [...(handlers.get(event) ?? []), fn]),
-		registerTool: (def: any) => tools.set(def.name, def),
+		registerTool: (def: any) => {
+			tools.set(def.name, def);
+			if (def.defaultActive !== false) activeTools.add(def.name);
+		},
+		getActiveTools: () => [...activeTools],
+		setActiveTools: (names: string[]) => { activeTools = new Set(names.filter((n) => tools.has(n) || ["read", "bash"].includes(n))); },
 		registerFlag: () => {},
 		getFlag: (n: string) => flags[n],
-		registerCommand: () => {},
-		appendEntry: () => {},
+		registerCommand: (n: string, def: any) => commands.set(n, def),
+		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
 		sendMessage: (message: any, options: any) => queued.push({ message, options }),
 	};
 	const ctx = {
@@ -45,7 +66,14 @@ async function agent(name: string, opts: { maxHops?: number; timeoutMs?: number 
 		cwd: "/tmp",
 		model: { id: "test-model" },
 		getContextUsage: () => ({ percent: 10 }),
-		ui: { notify() {}, setStatus() {}, setWidget() {} },
+		ui: { notify: (text: string, level: string) => notices.push({ text, level }), setStatus() {}, setWidget() {} },
+		sessionManager: {
+			getSessionFile: () => session.file,
+			getSessionId: () => `id:${session.file ?? "ephemeral"}`,
+			getEntries: () => entries,
+			// The current branch; tests can make it differ from the whole file.
+			getBranch: session.branch ?? (() => entries),
+		},
 	};
 	const state = installComs(pi, { comsDir, pingIntervalMs: 60_000, ...opts });
 	const emit = async (event: string, payload: any = {}) => {
@@ -53,11 +81,15 @@ async function agent(name: string, opts: { maxHops?: number; timeoutMs?: number 
 		for (const fn of handlers.get(event) ?? []) result = (await fn(payload, ctx)) ?? result;
 		return result;
 	};
-	await emit("session_start", { reason: "startup" });
+	await emit("session_start", session.start ?? { reason: "startup" });
 
 	return {
-		name,
+		get name() { return state.identity?.name ?? name; },
 		state,
+		notices,
+		activeComsTools: () => [...activeTools].filter((t) => t.startsWith("coms_")).sort(),
+		command: (args: string) => commands.get("coms").handler(args, ctx),
+		complete: (prefix: string) => commands.get("coms").getArgumentCompletions(prefix)?.map((i: any) => i.value) ?? null,
 		queued,
 		transcript,
 		tool: (toolName: string, params: any, signal?: AbortSignal) =>
@@ -78,6 +110,19 @@ async function agent(name: string, opts: { maxHops?: number; timeoutMs?: number 
 		},
 		settled: (aborted = false) => emit("agent_settled", { aborted }),
 		shutdown: () => emit("session_shutdown", { reason: "quit" }),
+		/**
+		 * /new, /resume, /fork or /reload: pi shuts this extension instance
+		 * down and starts a fresh one in the same process.
+		 */
+		replace: async (reason: "new" | "resume" | "fork" | "reload", nextFile = session.file) => {
+			await emit("session_shutdown", { reason });
+			// A fork starts as a copy of the conversation, records included.
+			if (reason === "fork") sessions.set(nextFile!, [...entries]);
+			const start = reason === "reload" ? { reason } : { reason, previousSessionFile: session.file };
+			// A reload continues the same branch; the others start elsewhere.
+			const branch = reason === "reload" ? session.branch : undefined;
+			return agent(name, opts, extraFlags, { file: nextFile, start, branch });
+		},
 	};
 }
 
@@ -279,7 +324,7 @@ test("shutting down fails unanswered messages instead of leaving senders waiting
 	const { details } = await a.tool("coms_send", { target: "bob", message: "hello" });
 	await until(() => b.queued.length === 1);
 	await b.shutdown();
-	const result = await a.tool("coms_await", { msg_id: details.msg_id });
+	const result = await a.tool("coms_await", { msg_id: details.msg_id, timeout_ms: 2000 });
 	assert.equal(result.details.error, "bob shut down before replying");
 	await assert.rejects(a.tool("coms_send", { target: "bob", message: "again" }), /no live agent named "bob"/);
 });
@@ -446,4 +491,359 @@ test("removing a dead entry leaves a newer agent with the same name alone", () =
 	registry.remove({ ...old, project: "test" });
 	assert.equal(readEntry("bob").session_id, "NEW");
 	assert.equal(fs.existsSync(old.endpoint), false);
+});
+
+// ━━ Opting in and out ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function agentFiles(project = "test") {
+	try { return fs.readdirSync(path.join(comsDir, "projects", project, "agents")); } catch { return []; }
+}
+
+test("a session without --coms or --coms-name stays out of coms", async () => {
+	const d = await agent(null);
+	agents.push(d);
+	assert.equal(d.state.identity, null);
+	assert.deepEqual(agentFiles(), []);
+	assert.deepEqual(d.activeComsTools(), []);
+	await assert.rejects(d.tool("coms_list", {}), /coms is off in this session/);
+	await d.command("");
+	assert.match(d.notices.at(-1)!.text, /coms is off.*\/coms join/);
+});
+
+test("--coms joins at startup with a generated name", async () => {
+	const c = await agent(null, {}, { coms: true });
+	agents.push(c);
+	assert.match(c.state.identity!.name, /^agent-[0-9a-z]{6}$/);
+	assert.deepEqual(c.activeComsTools(), ["coms_await", "coms_list", "coms_reply", "coms_send"]);
+});
+
+test("/coms join brings a running session into coms", async () => {
+	const a = await agent("alice");
+	const d = await agent(null);
+	agents.push(a, d);
+	await d.command('join carol --project test --purpose "Reviews code"');
+	assert.equal(d.notices.at(-1)!.text, "📡 joined coms as carol@test");
+	assert.deepEqual(d.activeComsTools(), ["coms_await", "coms_list", "coms_reply", "coms_send"]);
+	assert.equal(readEntry("carol").purpose, "Reviews code");
+
+	const list = await a.tool("coms_list", {});
+	assert.deepEqual(list.details.agents.map((x: any) => [x.name, x.purpose]), [["carol", "Reviews code"]]);
+	const { details } = await a.tool("coms_send", { target: "carol", message: "hi" });
+	await until(() => d.queued.length === 1);
+	await d.tool("coms_reply", { msg_id: details.msg_id, response: "hello" });
+	assert.equal((await a.tool("coms_await", { msg_id: details.msg_id })).content[0].text, "hello");
+});
+
+test("/coms leave fails unanswered messages and switches the tools off", async () => {
+	const { a, b } = await pair();
+	const { endpoint } = readEntry("bob");
+	const toBob = await a.tool("coms_send", { target: "bob", message: "hello" });
+	await until(() => b.queued.length === 1);
+	await b.tool("coms_send", { target: "alice", message: "a question bob won't wait for" });
+	await until(() => a.queued.length === 1);
+	b.queued.length = 0;
+
+	await b.command("leave");
+	assert.equal(b.notices.at(-1)!.text, "📡 bob left coms");
+	assert.equal((await a.tool("coms_await", { msg_id: toBob.details.msg_id, timeout_ms: 2000 })).details.error, "bob left coms before replying");
+	assert.equal(fs.existsSync(registryFile("bob")), false);
+	assert.equal(fs.existsSync(endpoint), false);
+	assert.deepEqual(b.activeComsTools(), []);
+	// Bob's own unanswered question is dropped rather than delivered.
+	assert.equal(b.queued.length, 0);
+});
+
+test("joining again under a new name replaces the old registration", async () => {
+	const { a, b } = await pair();
+	const toBob = await a.tool("coms_send", { target: "bob", message: "hello" });
+	await until(() => b.queued.length === 1);
+	await b.command("join robert");
+	assert.equal(b.state.identity!.name, "robert");
+	assert.deepEqual(agentFiles().sort(), ["alice.json", "robert.json"]);
+	assert.equal((await a.tool("coms_await", { msg_id: toBob.details.msg_id, timeout_ms: 2000 })).details.error, "bob left coms before replying");
+	await a.tool("coms_send", { target: "robert", message: "are you bob?" });
+});
+
+test("names and projects that aren't safe file names are rejected", async () => {
+	const d = await agent(null);
+	agents.push(d);
+	await d.command("join ../escape");
+	assert.match(d.notices.at(-1)!.text, /name "\.\.\/escape" may only use/);
+	await d.command("join ok --project a/b");
+	assert.match(d.notices.at(-1)!.text, /project "a\/b" may only use/);
+	await d.command('join ok extra words');
+	assert.match(d.notices.at(-1)!.text, /quote a purpose/);
+	assert.equal(d.state.identity, null);
+});
+
+// ━━ Projects ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+test("agents in different projects can't see or message each other", async () => {
+	const a = await agent("alice");
+	const other = await agent("bob", {}, { "coms-project": "other" });
+	const sameName = await agent("bob");
+	agents.push(a, other, sameName);
+	const otherId = other.state.identity!.session_id;
+
+	const list = await a.tool("coms_list", {});
+	assert.deepEqual(list.details.agents.map((x: any) => x.session_id), [sameName.state.identity!.session_id]);
+	// "bob" resolves to the bob in alice's own project, never the other one.
+	await a.tool("coms_send", { target: "bob", message: "hi" });
+	await until(() => sameName.queued.length === 1);
+	assert.equal(other.queued.length, 0);
+	await assert.rejects(a.tool("coms_send", { target: otherId, message: "hi" }), /no live agent named .* in project test/);
+});
+
+test("/coms completes subcommands but not ones already typed in full", async () => {
+	const d = await agent(null);
+	agents.push(d);
+	assert.deepEqual(d.complete(""), ["join", "leave"]);
+	assert.deepEqual(d.complete("le"), ["leave"]);
+	assert.equal(d.complete("leave"), null);
+	assert.equal(d.complete("join planner"), null);
+});
+
+// ━━ Review fixes ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+test("/reload keeps a session joined, /new starts out, and a later /resume rejoins", async () => {
+	const d = await agent(null, {}, {}, { file: "/sessions/one.jsonl" });
+	await d.command('join carol --project shop --purpose "Reviews code"');
+	const reloaded = await d.replace("reload");
+	const self = reloaded.state.identity!;
+	assert.deepEqual([self.name, self.project, self.purpose], ["carol", "shop", "Reviews code"]);
+
+	const fresh = await reloaded.replace("new", "/sessions/two.jsonl");
+	assert.equal(fresh.state.identity, null);
+	assert.deepEqual(agentFiles("shop"), []);
+	assert.deepEqual(fresh.activeComsTools(), []);
+
+	const resumed = await fresh.replace("resume", "/sessions/one.jsonl");
+	agents.push(resumed);
+	assert.equal(resumed.state.identity?.name, "carol");
+	assert.equal(resumed.state.identity?.project, "shop");
+});
+
+test("startup flags don't rejoin after /new", async () => {
+	const b = await agent("bob", {}, {}, { file: "/sessions/bob.jsonl" });
+	const fresh = await b.replace("new", "/sessions/bob-2.jsonl");
+	agents.push(fresh);
+	assert.equal(fresh.state.identity, null);
+	assert.deepEqual(agentFiles(), []);
+});
+
+test("a fork starts out of coms even though it copies the conversation", async () => {
+	const b = await agent("bob", {}, {}, { file: "/sessions/bob.jsonl" });
+	const forked = await b.replace("fork", "/sessions/bob-fork.jsonl");
+	agents.push(forked);
+	assert.equal(forked.state.identity, null);
+});
+
+test("pi --fork at startup also starts out of coms", async () => {
+	const d = await agent(null, {}, {}, { file: "/sessions/orig.jsonl" });
+	await d.command("join carol --project shop");
+	await d.shutdown();
+	sessions.set("/sessions/forked.jsonl", [...sessions.get("/sessions/orig.jsonl")!]);
+	const forked = await agent(null, {}, {}, { file: "/sessions/forked.jsonl" });
+	agents.push(forked);
+	assert.equal(forked.state.identity, null);
+});
+
+test("/coms leave sticks when the conversation is resumed", async () => {
+	const b = await agent("bob", {}, {}, { file: "/sessions/bob.jsonl" });
+	await b.command("leave");
+	const resumed = await b.replace("resume");
+	agents.push(resumed);
+	assert.equal(resumed.state.identity, null);
+});
+
+test("pi -c rejoins a conversation that was joined when pi quit", async () => {
+	const d = await agent(null, {}, {}, { file: "/sessions/c.jsonl" });
+	await d.command("join carol --project shop");
+	await d.shutdown();
+	// pi -c: a fresh process, startup reason, same session file, no coms flags.
+	const continued = await agent(null, {}, {}, { file: "/sessions/c.jsonl" });
+	agents.push(continued);
+	assert.equal(continued.state.identity?.name, "carol");
+	assert.equal(continued.state.identity?.project, "shop");
+});
+
+test("coms flags given with pi -c win over the conversation's record", async () => {
+	const d = await agent(null, {}, {}, { file: "/sessions/c2.jsonl" });
+	await d.command("join carol --project shop");
+	await d.shutdown();
+	const continued = await agent("dave", {}, {}, { file: "/sessions/c2.jsonl" });
+	agents.push(continued);
+	assert.equal(continued.state.identity?.name, "dave");
+	assert.equal(continued.state.identity?.project, "test");
+});
+
+test("renaming with /coms join keeps the current project and purpose", async () => {
+	const d = await agent(null);
+	agents.push(d);
+	await d.command('join carol --project shop --purpose "Reviews code"');
+	await d.command("join caroline");
+	const self = d.state.identity!;
+	assert.deepEqual([self.name, self.project, self.purpose], ["caroline", "shop", "Reviews code"]);
+});
+
+test("a message arriving while a session leaves is refused, not stranded", async () => {
+	const { a, b } = await pair();
+	// A sender that never answers, so failing its message keeps leave() waiting.
+	const hung = await fakePeer("hung", () => {});
+	try {
+		await sendRaw(readEntry("bob").endpoint, { type: "prompt", sender_endpoint: hung.endpoint, sender_name: "hung" });
+		await until(() => b.state.inbound.size === 1);
+		const leaving = b.command("leave");
+		// Bob is already gone for everyone else while leave() waits on the hung sender.
+		assert.equal(fs.existsSync(registryFile("bob")), false);
+		await assert.rejects(a.tool("coms_send", { target: "bob", message: "hi" }), /no live agent named "bob"/);
+		hung.close();
+		await leaving;
+		assert.equal(b.state.inbound.size, 0);
+		assert.equal(b.notices.some((n) => n.level === "error"), false);
+	} finally {
+		hung.close();
+	}
+});
+
+test("quitting while /coms leave is still finishing doesn't crash", async () => {
+	const { b } = await pair();
+	const hung = await fakePeer("hung", () => {});
+	try {
+		await sendRaw(readEntry("bob").endpoint, { type: "prompt", sender_endpoint: hung.endpoint, sender_name: "hung" });
+		await until(() => b.state.inbound.size === 1);
+		const leaving = b.command("leave");
+		await b.shutdown();
+		hung.close();
+		await leaving;
+		assert.deepEqual(b.notices.filter((n) => n.level === "error"), []);
+	} finally {
+		hung.close();
+	}
+});
+
+test("rejoining another project mid-ping doesn't carry over the old project's peers", async () => {
+	const a = await agent("alice");
+	const b = await agent("bob", { pingTimeoutMs: 300 });
+	agents.push(a, b);
+	const hung = await fakePeer("hung", () => {});
+	try {
+		writeEntry({ name: "hung", endpoint: hung.endpoint });
+		const status = b.command(""); // pings alice and the hung peer
+		await new Promise((r) => setTimeout(r, 50));
+		await b.command("join bob --project other");
+		await status;
+		assert.deepEqual(b.state.poolRows().map((r: any) => r.name), []);
+	} finally {
+		hung.close();
+	}
+});
+
+test("shutting down during a join cancels it instead of leaving a ghost agent", async () => {
+	const { b } = await pair();
+	const hung = await fakePeer("hung", () => {});
+	try {
+		await sendRaw(readEntry("bob").endpoint, { type: "prompt", sender_endpoint: hung.endpoint, sender_name: "hung" });
+		await until(() => b.state.inbound.size === 1);
+		const rejoining = b.command("join robert"); // waits in leave() on the hung sender
+		await b.shutdown();
+		hung.close();
+		await rejoining;
+		await new Promise((r) => setTimeout(r, 50));
+		assert.deepEqual(agentFiles().sort(), ["alice.json"]);
+		assert.equal(b.state.identity, null);
+	} finally {
+		hung.close();
+	}
+});
+
+test("a borrowed frontmatter name is tidied rather than rejected", async () => {
+	const dir = fs.mkdtempSync("/tmp/coms-fm-");
+	const file = path.join(dir, "reviewer.md");
+	fs.writeFileSync(file, "---\nname: Code Reviewer\ndescription: Reviews code\n---\nYou review code.\n");
+	process.argv.push("--system-prompt", file);
+	try {
+		const c = await agent(null, {}, { coms: true });
+		agents.push(c);
+		assert.equal(c.state.identity?.name, "Code-Reviewer");
+		assert.equal(c.state.identity?.purpose, "Reviews code");
+	} finally {
+		process.argv.splice(-2, 2);
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+/** Sends a hand-built envelope, filling in the fields every envelope needs. */
+function sendRaw(endpoint: string, fields: Record<string, unknown>) {
+	return new Promise<void>((resolve, reject) => {
+		const sock = net.createConnection({ path: endpoint });
+		sock.once("error", reject);
+		sock.once("connect", () => {
+			sock.write(JSON.stringify({
+				msg_id: `raw-${Math.random().toString(36).slice(2)}`, sender_session: "raw", hops: 0,
+				timestamp: new Date().toISOString(), prompt: "hello", sender_cwd: "/tmp", ...fields,
+			}) + "\n");
+			sock.once("data", () => { sock.end(); resolve(); });
+		});
+	});
+}
+
+// ━━ Second review ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+test("a peer that joins while pings are in flight isn't reported as gone", async () => {
+	const a = await agent("alice", { pingTimeoutMs: 300 });
+	agents.push(a);
+	const hung = await fakePeer("hung", () => {});
+	try {
+		writeEntry({ name: "hung", endpoint: hung.endpoint });
+		const status = a.command(""); // refreshes, waiting on the hung peer
+		await new Promise((r) => setTimeout(r, 50));
+		const carol = await agent("carol");
+		agents.push(carol);
+		await a.tool("coms_send", { target: "carol", message: "hi" });
+		await status;
+		assert.deepEqual(a.queued.map((q) => q.message.details?.error), []);
+		assert.equal([...a.state.outbound.values()][0].result, undefined);
+	} finally {
+		hung.close();
+	}
+});
+
+test("/coms join without a name keeps the current name", async () => {
+	const d = await agent(null);
+	agents.push(d);
+	await d.command("join carol --project shop");
+	await d.command('join --purpose "Reviews code"');
+	const self = d.state.identity!;
+	assert.deepEqual([self.name, self.project, self.purpose], ["carol", "shop", "Reviews code"]);
+});
+
+test("membership survives /tree moving the branch away from the join", async () => {
+	let branch: any[] = [];
+	const d = await agent(null, {}, {}, { file: "/sessions/tree.jsonl", branch: () => branch });
+	await d.command("join carol --project shop");
+	branch = []; // /tree back to before the join
+	const reloaded = await d.replace("reload");
+	agents.push(reloaded);
+	assert.equal(reloaded.state.identity?.name, "carol");
+});
+
+test("a clash is resolved with a suffix, but the name asked for is what's recorded", async () => {
+	const c = await agent("carol");
+	const d = await agent(null, {}, {}, { file: "/sessions/d.jsonl" });
+	agents.push(c);
+	await d.command("join carol --project test");
+	assert.equal(d.state.identity!.name, "carol2");
+	await c.shutdown();
+	const resumed = await d.replace("resume");
+	agents.push(resumed);
+	assert.equal(resumed.state.identity!.name, "carol");
+});
+
+test("suffixed names stay within 32 characters", () => {
+	const registry = createRegistry(comsDir);
+	const long = "a".repeat(32);
+	writeEntry({ name: long });
+	const name = registry.uniqueName("test", long);
+	assert.equal(name, "a".repeat(31) + "2");
 });
