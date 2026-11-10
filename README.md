@@ -6,10 +6,20 @@ Forked from `extensions/coms.ts` in [disler/pi-vs-claude-code](https://github.co
 
 ## Run
 
+Load it into the sessions that should talk to each other:
+
 ```bash
-pi -e ~/Development/pi-coms --coms-name planner --coms-purpose "Plans the work"
-pi -e ~/Development/pi-coms --coms-name coder   --coms-purpose "Writes the code"
+pi -e git:github.com/dcryan/pi-coms --coms-name planner --coms-purpose "Plans the work"
+pi -e git:github.com/dcryan/pi-coms --coms-name coder   --coms-purpose "Writes the code"
 ```
+
+Or install it so every pi session joins:
+
+```bash
+pi install git:github.com/dcryan/pi-coms
+```
+
+From a clone, use `pi -e ./pi-coms`.
 
 | Flag | Default |
 |---|---|

@@ -3,9 +3,22 @@
   "version": "0.1.0",
   "private": true,
   "description": "Peer-to-peer messaging between pi sessions on the same machine",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dcryan/pi-coms.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "agents",
+    "messaging"
+  ],
   "type": "module",
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "scripts": {
     "test": "node --test tests/*.test.ts",
