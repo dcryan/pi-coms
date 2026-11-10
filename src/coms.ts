@@ -421,7 +421,8 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 		if (!identity) return;
 		const peers = registry.live(identity.project).filter((e) => e.session_id !== identity!.session_id);
 		const cards = await Promise.all(peers.map((p) => pingPeer(p)));
-		failOrphanedOutbound(new Set(registry.liveAll().map((e) => e.session_id)));
+		const liveSessions = new Set(registry.liveAll().map((e) => e.session_id));
+		failOrphanedOutbound(liveSessions);
 		let changed = false;
 		const seen = new Set<string>();
 		peers.forEach((peer, i) => {
@@ -435,10 +436,11 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 				changed = true;
 			}
 		});
+		// A peer whose registry entry is gone is dead. One that is still
+		// registered but not answering is shown as stale for a while first.
 		for (const [sid, card] of peerCards) {
 			if (seen.has(sid)) continue;
-			card.staleCount++;
-			if (card.staleCount > 6) peerCards.delete(sid);
+			if (!liveSessions.has(sid) || ++card.staleCount > 6) peerCards.delete(sid);
 			changed = true;
 		}
 		if (changed) installPoolWidget();
@@ -818,5 +820,6 @@ export function installComs(pi: any, options: ComsOptions = {}) {
 		get identity() { return identity; },
 		inbound,
 		outbound,
+		poolRows,
 	};
 }

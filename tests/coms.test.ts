@@ -369,6 +369,7 @@ test("a crashed agent is removed and its senders stop waiting", async () => {
 	const child = await spawnAgent("crashy");
 	const { endpoint } = readEntry("crashy");
 	const sent = await a.tool("coms_send", { target: "crashy", message: "are you there?" });
+	await until(() => a.state.poolRows().some((r: any) => r.name === "crashy" && !r.pending && !r.stale));
 
 	await kill9(child);
 	assert.ok(fs.existsSync(endpoint), "the crash left its socket file behind");
@@ -376,6 +377,8 @@ test("a crashed agent is removed and its senders stop waiting", async () => {
 	await until(() => a.queued.length === 1);
 	assert.equal(a.queued[0].message.details.msg_id, sent.details.msg_id);
 	assert.equal(a.queued[0].message.details.error, "crashy is no longer running");
+	// Gone from the widget in the same ping cycle, not after several missed pings.
+	assert.equal(a.state.poolRows().some((r: any) => r.name === "crashy"), false);
 	assert.equal(fs.existsSync(registryFile("crashy")), false);
 	assert.equal(fs.existsSync(endpoint), false);
 });
